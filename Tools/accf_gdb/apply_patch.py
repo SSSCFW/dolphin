@@ -10,29 +10,30 @@ def block(text: str) -> str:
     return textwrap.dedent(text).strip("\n")
 
 
-def replace_once(path: Path, old: str, new: str) -> None:
-    text = path.read_text(encoding="utf-8")
+def replace_unique(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"{path}: expected exactly one match, found {count}")
-    path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+        raise RuntimeError(f"{label}: expected exactly one match, found {count}")
+    return text.replace(old, new, 1)
 
 
 def main() -> int:
-    gdb = ROOT / "Source/Core/Core/PowerPC/GDBStub.cpp"
-    core = ROOT / "Source/Core/Core/Core.cpp"
-    settings_cpp = ROOT / "Source/Core/Core/Config/MainSettings.cpp"
-    settings_h = ROOT / "Source/Core/Core/Config/MainSettings.h"
+    paths = {
+        "gdb": ROOT / "Source/Core/Core/PowerPC/GDBStub.cpp",
+        "core": ROOT / "Source/Core/Core/Core.cpp",
+        "settings_cpp": ROOT / "Source/Core/Core/Config/MainSettings.cpp",
+        "settings_h": ROOT / "Source/Core/Core/Config/MainSettings.h",
+    }
+    src = {name: path.read_text(encoding="utf-8") for name, path in paths.items()}
 
-    marker = "ACCF_GDB_LATE_ATTACH"
-    if marker in gdb.read_text(encoding="utf-8"):
+    if "ACCF_GDB_LATE_ATTACH" in src["gdb"]:
         print("ACCF GDB patch already applied")
         return 0
 
-    # Add a normal Dolphin configuration value. This makes the interval available through
-    # Dolphin.ini and the existing -C command-line override mechanism.
-    replace_once(
-        settings_cpp,
+    # Build every changed file in memory first. Nothing is written until every
+    # replacement and validation has succeeded, preventing half-applied patches.
+    settings_cpp = replace_unique(
+        src["settings_cpp"],
         'const Info<int> MAIN_GDB_PORT{{System::Main, "General", "GDBPort"}, -1};',
         block(
             '''
@@ -41,20 +42,29 @@ def main() -> int:
                 {System::Main, "General", "GDBUpdateCycles"}, 5000000};
             '''
         ),
+        "MainSettings.cpp GDBUpdateCycles",
     )
-    replace_once(
-        settings_h,
+    settings_h = replace_unique(
+        src["settings_h"],
         'extern const Info<int> MAIN_GDB_PORT;',
         'extern const Info<int> MAIN_GDB_PORT;\nextern const Info<int> MAIN_GDB_UPDATE_CYCLES;',
+        "MainSettings.h GDBUpdateCycles",
     )
 
-    replace_once(gdb, '#include <fmt/format.h>', '#include <algorithm>\n\n#include <fmt/format.h>')
-    replace_once(
+    gdb = src["gdb"]
+    gdb = replace_unique(
+        gdb,
+        '#include <fmt/format.h>',
+        '#include <algorithm>\n\n#include <fmt/format.h>',
+        "GDBStub.cpp algorithm include",
+    )
+    gdb = replace_unique(
         gdb,
         '#include "Core/Core.h"\n#include "Core/HW/CPU.h"',
         '#include "Core/Config/MainSettings.h"\n#include "Core/Core.h"\n#include "Core/HW/CPU.h"',
+        "GDBStub.cpp MainSettings include",
     )
-    replace_once(
+    gdb = replace_unique(
         gdb,
         'const s64 GDB_UPDATE_CYCLES = 100000;',
         block(
@@ -69,6 +79,7 @@ def main() -> int:
             }
             '''
         ),
+        "GDBStub.cpp polling constant",
     )
 
     socket_helpers = block(
@@ -81,6 +92,7 @@ def main() -> int:
             return false;
 
           timeval timeout = {};
+          timeout.tv_sec = 0;
           timeout.tv_usec = timeout_us;
 
           fd_set fds;
@@ -132,21 +144,21 @@ def main() -> int:
 
           INFO_LOG_FMT(GDB_STUB, "GDB client connected (late attach).");
           s_just_connected = true;
-          // Attaching must not pause the game by itself. The client can send Ctrl+C when it
-          // actually wants control.
+          // Attaching does not pause by itself. The client sends Ctrl+C when it wants control.
           s_has_control = false;
         }
 
         static const char* CommandBufferAsString()
         '''
     )
-    replace_once(
+    gdb = replace_unique(
         gdb,
         'static CoreTiming::EventType* s_update_event;\n\nstatic const char* CommandBufferAsString()',
         socket_helpers,
+        "GDBStub.cpp socket helpers",
     )
 
-    replace_once(
+    gdb = replace_unique(
         gdb,
         block(
             '''
@@ -175,31 +187,17 @@ def main() -> int:
             }
             '''
         ),
+        "GDBStub.cpp update callback",
     )
 
-    replace_once(
+    gdb = replace_unique(
         gdb,
-        block(
-            '''
-              if (res != 1)
-              {
-                ERROR_LOG_FMT(GDB_STUB, "recv failed : {}", res);
-                Deinit();
-              }
-            '''
-        ),
-        block(
-            '''
-              if (res != 1)
-              {
-                ERROR_LOG_FMT(GDB_STUB, "recv failed : {}", res);
-                DisconnectClient();
-              }
-            '''
-        ),
+        '  if (res != 1)\n  {\n    ERROR_LOG_FMT(GDB_STUB, "recv failed : {}", res);\n    Deinit();\n  }',
+        '  if (res != 1)\n  {\n    ERROR_LOG_FMT(GDB_STUB, "recv failed : {}", res);\n    DisconnectClient();\n  }',
+        "GDBStub.cpp receive disconnect",
     )
 
-    replace_once(
+    gdb = replace_unique(
         gdb,
         block(
             '''
@@ -234,63 +232,35 @@ def main() -> int:
             }
             '''
         ),
+        "GDBStub.cpp data availability",
     )
-
-    replace_once(
+    gdb = replace_unique(
         gdb,
         '  if (!IsActive())\n    return;\n\n  memset(s_cmd_bfr, 0, sizeof s_cmd_bfr);',
         '  if (s_sock == -1)\n    return;\n\n  memset(s_cmd_bfr, 0, sizeof s_cmd_bfr);',
+        "GDBStub.cpp SendReply active client check",
     )
-    replace_once(
+    gdb = replace_unique(
         gdb,
-        block(
-            '''
-                if (n < 0)
-                {
-                  ERROR_LOG_FMT(GDB_STUB, "gdb: send failed");
-                  return Deinit();
-                }
-            '''
-        ),
-        block(
-            '''
-                if (n < 0)
-                {
-                  ERROR_LOG_FMT(GDB_STUB, "gdb: send failed");
-                  DisconnectClient();
-                  return;
-                }
-            '''
-        ),
+        '    if (n < 0)\n    {\n      ERROR_LOG_FMT(GDB_STUB, "gdb: send failed");\n      return Deinit();\n    }',
+        '    if (n < 0)\n    {\n      ERROR_LOG_FMT(GDB_STUB, "gdb: send failed");\n      DisconnectClient();\n      return;\n    }',
+        "GDBStub.cpp send disconnect",
     )
 
-    replace_once(
+    gdb = replace_unique(
         gdb,
         '  while (IsActive())\n  {\n    if (cpu.GetState() == CPU::State::PowerDown)',
         '  while (s_sock != -1)\n  {\n    if (cpu.GetState() == CPU::State::PowerDown)',
+        "GDBStub.cpp command loop client condition",
     )
-    replace_once(
+    gdb = replace_unique(
         gdb,
-        block(
-            '''
-                case 'k':
-                  Deinit();
-                  INFO_LOG_FMT(GDB_STUB, "killed by gdb");
-                  return;
-            '''
-        ),
-        block(
-            '''
-                case 'k':
-                  DisconnectClient();
-                  INFO_LOG_FMT(GDB_STUB, "gdb client disconnected");
-                  return;
-            '''
-        ),
+        '    case \'k\':\n      Deinit();\n      INFO_LOG_FMT(GDB_STUB, "killed by gdb");\n      return;',
+        '    case \'k\':\n      DisconnectClient();\n      INFO_LOG_FMT(GDB_STUB, "gdb client disconnected");\n      return;',
+        "GDBStub.cpp kill command",
     )
 
-    # Keep a listener alive instead of blocking in accept() during game boot.
-    replace_once(
+    gdb = replace_unique(
         gdb,
         block(
             '''
@@ -299,14 +269,15 @@ def main() -> int:
             '''
         ),
         'static void InitGeneric(int domain, const sockaddr* server_addr, socklen_t server_addrlen);',
+        "GDBStub.cpp InitGeneric declaration",
     )
-    replace_once(
+    gdb = replace_unique(
         gdb,
         '  InitGeneric(PF_LOCAL, (const sockaddr*)&addr, sizeof(addr), nullptr, nullptr);',
         '  InitGeneric(PF_LOCAL, (const sockaddr*)&addr, sizeof(addr));',
+        "GDBStub.cpp local InitGeneric call",
     )
-
-    replace_once(
+    gdb = replace_unique(
         gdb,
         block(
             '''
@@ -343,8 +314,9 @@ def main() -> int:
             }
             '''
         ),
+        "GDBStub.cpp TCP Init",
     )
-    replace_once(
+    gdb = replace_unique(
         gdb,
         block(
             '''
@@ -353,48 +325,40 @@ def main() -> int:
             '''
         ),
         'static void InitGeneric(int domain, const sockaddr* server_addr, socklen_t server_addrlen)',
+        "GDBStub.cpp InitGeneric definition",
     )
-
-    replace_once(
+    gdb = replace_unique(
         gdb,
-        block(
-            '''
-              INFO_LOG_FMT(GDB_STUB, "Waiting for gdb to connect...");
+        '''  INFO_LOG_FMT(GDB_STUB, "Waiting for gdb to connect...");
 
-              s_sock = accept(s_tmpsock, client_addr, client_addrlen);
-              if (s_sock < 0)
-                ERROR_LOG_FMT(GDB_STUB, "Failed to accept gdb client");
-              INFO_LOG_FMT(GDB_STUB, "Client connected.");
-              s_just_connected = true;
+  s_sock = accept(s_tmpsock, client_addr, client_addrlen);
+  if (s_sock < 0)
+    ERROR_LOG_FMT(GDB_STUB, "Failed to accept gdb client");
+  INFO_LOG_FMT(GDB_STUB, "Client connected.");
+  s_just_connected = true;
 
-            #ifdef _WIN32
-              closesocket(s_tmpsock);
-            #else
-              close(s_tmpsock);
-            #endif
-              s_tmpsock = -1;
+#ifdef _WIN32
+  closesocket(s_tmpsock);
+#else
+  close(s_tmpsock);
+#endif
+  s_tmpsock = -1;
 
-              auto& system = Core::System::GetInstance();
-              auto& core_timing = system.GetCoreTiming();
-              s_update_event = core_timing.RegisterEvent("GDBStubUpdate", UpdateCallback);
-              core_timing.ScheduleEvent(GDB_UPDATE_CYCLES, s_update_event);
-              s_has_control = true;
-            '''
-        ),
-        block(
-            '''
-              INFO_LOG_FMT(GDB_STUB, "GDB stub listening for late attach...");
+  auto& system = Core::System::GetInstance();
+  auto& core_timing = system.GetCoreTiming();
+  s_update_event = core_timing.RegisterEvent("GDBStubUpdate", UpdateCallback);
+  core_timing.ScheduleEvent(GDB_UPDATE_CYCLES, s_update_event);
+  s_has_control = true;''',
+        '''  INFO_LOG_FMT(GDB_STUB, "GDB stub listening for late attach...");
 
-              auto& system = Core::System::GetInstance();
-              auto& core_timing = system.GetCoreTiming();
-              s_update_event = core_timing.RegisterEvent("GDBStubUpdate", UpdateCallback);
-              core_timing.ScheduleEvent(GetGDBUpdateCycles(), s_update_event);
-              s_has_control = false;
-            '''
-        ),
+  auto& system = Core::System::GetInstance();
+  auto& core_timing = system.GetCoreTiming();
+  s_update_event = core_timing.RegisterEvent("GDBStubUpdate", UpdateCallback);
+  core_timing.ScheduleEvent(GetGDBUpdateCycles(), s_update_event);
+  s_has_control = false;''',
+        "GDBStub.cpp blocking accept removal",
     )
-
-    replace_once(
+    gdb = replace_unique(
         gdb,
         block(
             '''
@@ -427,22 +391,53 @@ def main() -> int:
             }
             '''
         ),
+        "GDBStub.cpp Deinit",
     )
 
-    # Enabling GDB must no longer force the initial CPU state to Paused.
-    replace_once(
+    core = src["core"]
+    core = replace_unique(
         core,
         '      GDBStub::InitLocal(gdb_socket.data());\n      CPUSetInitialExecutionState(system, true);',
         '      GDBStub::InitLocal(gdb_socket.data());\n      CPUSetInitialExecutionState(system);',
+        "Core.cpp local GDB initial state",
     )
-    replace_once(
+    core = replace_unique(
         core,
         '        GDBStub::Init(gdb_port);\n        CPUSetInitialExecutionState(system, true);',
         '        GDBStub::Init(gdb_port);\n        CPUSetInitialExecutionState(system);',
+        "Core.cpp TCP GDB initial state",
     )
 
-    print("Applied ACCF GDB late-attach patch")
-    print("Default GDBUpdateCycles: 5000000")
+    # Final guards: catch precisely the stale symbols that caused CI #5 to fail.
+    forbidden = [
+        'const s64 GDB_UPDATE_CYCLES = 100000;',
+        'ScheduleEvent(GDB_UPDATE_CYCLES, s_update_event)',
+        's_sock = accept(s_tmpsock, client_addr, client_addrlen)',
+    ]
+    for token in forbidden:
+        if token in gdb:
+            raise RuntimeError(f"GDBStub.cpp validation failed: stale token {token!r}")
+    required = [
+        'GetGDBUpdateCycles()',
+        'GDB client connected (late attach).',
+        'htonl(INADDR_LOOPBACK)',
+        'DisconnectClient();',
+    ]
+    for token in required:
+        if token not in gdb:
+            raise RuntimeError(f"GDBStub.cpp validation failed: missing token {token!r}")
+
+    outputs = {
+        paths["gdb"]: gdb,
+        paths["core"]: core,
+        paths["settings_cpp"]: settings_cpp,
+        paths["settings_h"]: settings_h,
+    }
+    for path, text in outputs.items():
+        path.write_text(text, encoding="utf-8", newline="\n")
+
+    print("Applied ACCF GDB late-attach patch atomically")
+    print("Default GDBUpdateCycles: 5000000 (minimum: 1000)")
     print("Dolphin.ini: [General] GDBUpdateCycles = <cycles>")
     print("CLI: -C Dolphin.General.GDBUpdateCycles=<cycles>")
     return 0
