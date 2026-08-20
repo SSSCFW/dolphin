@@ -8,6 +8,12 @@ on:
     paths:
       - "Tools/accf_gdb/**"
       - ".github/workflows/build-accf-gdb-windows.yml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "Tools/accf_gdb/**"
+      - ".github/workflows/build-accf-gdb-windows.yml"
 
 permissions:
   contents: read
