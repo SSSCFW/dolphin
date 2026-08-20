@@ -1,0 +1,88 @@
+name: Build ACCF GDB Dolphin (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - accf-gdb-late-attach
+    paths:
+      - "Tools/accf_gdb/**"
+      - ".github/workflows/build-accf-gdb-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Dolphin with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply ACCF GDB late-attach patch
+        shell: pwsh
+        run: |
+          python Tools/accf_gdb/apply_patch.py
+          git diff --check
+          git diff -- Source/Core/Core/PowerPC/GDBStub.cpp Source/Core/Core/Core.cpp Source/Core/Core/Config/MainSettings.cpp Source/Core/Core/Config/MainSettings.h
+
+      - name: Configure Visual Studio 2022 x64
+        shell: pwsh
+        run: |
+          cmake -S . -B build-accf-gdb -G "Visual Studio 17 2022" -A x64 `
+            -DENABLE_TESTS=OFF `
+            -DUSE_MGBA=OFF `
+            -DENABLE_AUTOUPDATE=OFF `
+            -DCMAKE_VS_GLOBALS=UseStructuredOutput=false
+
+          @"
+          <Project>
+            <PropertyGroup>
+              <UseStructuredOutput>false</UseStructuredOutput>
+            </PropertyGroup>
+          </Project>
+          "@ | Set-Content -Encoding UTF8 build-accf-gdb/Directory.Build.props
+
+      - name: Build Release x64
+        shell: pwsh
+        run: cmake --build build-accf-gdb --config Release --target dolphin-emu --parallel 4
+
+      - name: Verify Dolphin binary
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build-accf-gdb/Binaries/Dolphin.exe")) {
+            throw "Dolphin.exe was not produced"
+          }
+          Get-ChildItem build-accf-gdb/Binaries
+
+      - name: Write build information
+        shell: pwsh
+        run: |
+          @"
+          ACCF GDB Dolphin custom build
+          Source commit: ${{ github.sha }}
+          GDB late attach: enabled
+          Default GDBUpdateCycles: 5000000
+
+          Dolphin.ini:
+          [General]
+          GDBPort = 55555
+          GDBUpdateCycles = 5000000
+
+          Command line override example:
+          Dolphin.exe -d -C Dolphin.General.GDBPort=55555 -C Dolphin.General.GDBUpdateCycles=5000000
+          "@ | Set-Content -Encoding UTF8 build-accf-gdb/Binaries/ACCF-GDB-BUILD.txt
+
+      - name: Upload Dolphin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-ACCF-GDB-Windows-x64
+          path: build-accf-gdb/Binaries/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
