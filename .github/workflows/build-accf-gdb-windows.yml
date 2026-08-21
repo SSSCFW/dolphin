@@ -1,0 +1,122 @@
+name: Build ACCF GDB Dolphin (Windows)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "Tools/accf_gdb/**"
+      - ".github/workflows/build-accf-gdb-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Dolphin with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply ACCF GDB patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python Tools/accf_gdb/apply_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python Tools/accf_gdb/apply_manual_resume_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git diff -- Source/Core/Core/PowerPC/GDBStub.cpp Source/Core/Core/PowerPC/GDBStub.h Source/Core/Core/Core.cpp Source/Core/Core/Config/MainSettings.cpp Source/Core/Core/Config/MainSettings.h Source/Core/DolphinQt/MainWindow.cpp
+
+          $gdb = Get-Content -Raw Source/Core/Core/PowerPC/GDBStub.cpp
+          if ($gdb.Contains("ScheduleEvent(GDB_UPDATE_CYCLES, s_update_event)")) {
+            throw "Stale GDB_UPDATE_CYCLES scheduling call remains after patch"
+          }
+          if (-not $gdb.Contains("GetGDBUpdateCycles()")) {
+            throw "GetGDBUpdateCycles() missing after patch"
+          }
+          if (-not $gdb.Contains("qDolphinState")) {
+            throw "qDolphinState support missing after patch"
+          }
+          if (-not $gdb.Contains("loop_until_continue && !s_has_control.load()")) {
+            throw "manual GDB resume loop escape missing after patch"
+          }
+
+          $mainWindow = Get-Content -Raw Source/Core/DolphinQt/MainWindow.cpp
+          if (-not $mainWindow.Contains("GDBStub::ReleaseControl();")) {
+            throw "Dolphin GUI manual GDB resume hook missing after patch"
+          }
+
+      - name: Configure Visual Studio 2022 x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake -S . -B build-accf-gdb -G "Visual Studio 17 2022" -A x64 `
+            -DENABLE_TESTS=OFF `
+            -DUSE_MGBA=OFF `
+            -DENABLE_AUTOUPDATE=OFF `
+            -DCMAKE_VS_GLOBALS=UseStructuredOutput=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          @"
+          <Project>
+            <PropertyGroup>
+              <UseStructuredOutput>false</UseStructuredOutput>
+            </PropertyGroup>
+          </Project>
+          "@ | Set-Content -Encoding UTF8 build-accf-gdb/Directory.Build.props
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build build-accf-gdb --config Release --target dolphin-emu --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Dolphin binary
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build-accf-gdb/Binaries/Dolphin.exe")) {
+            throw "Dolphin.exe was not produced"
+          }
+          Get-ChildItem build-accf-gdb/Binaries
+
+      - name: Write build information
+        shell: pwsh
+        run: |
+          @"
+          ACCF GDB Dolphin custom build
+          Source commit: ${{ github.sha }}
+          GDB late attach: enabled
+          Manual GUI resume from GDB stop: enabled
+          MCP target-state query (qDolphinState): enabled
+          Default GDBUpdateCycles: 5000000
+          Minimum GDBUpdateCycles: 1000
+
+          Dolphin.ini:
+          [General]
+          GDBPort = 55555
+          GDBUpdateCycles = 5000000
+
+          Command line override example:
+          Dolphin.exe -d -C Dolphin.General.GDBPort=55555 -C Dolphin.General.GDBUpdateCycles=5000000
+          "@ | Set-Content -Encoding UTF8 build-accf-gdb/Binaries/ACCF-GDB-BUILD.txt
+
+      - name: Upload Dolphin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-ACCF-GDB-Windows-x64
+          path: build-accf-gdb/Binaries/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
