@@ -24,17 +24,19 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Apply ACCF GDB late-attach patch
+      - name: Apply ACCF GDB patches
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           python Tools/accf_gdb/apply_patch.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python Tools/accf_gdb/apply_manual_resume_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          git diff -- Source/Core/Core/PowerPC/GDBStub.cpp Source/Core/Core/Core.cpp Source/Core/Core/Config/MainSettings.cpp Source/Core/Core/Config/MainSettings.h
+          git diff -- Source/Core/Core/PowerPC/GDBStub.cpp Source/Core/Core/PowerPC/GDBStub.h Source/Core/Core/Core.cpp Source/Core/Core/Config/MainSettings.cpp Source/Core/Core/Config/MainSettings.h Source/Core/DolphinQt/MainWindow.cpp
 
           $gdb = Get-Content -Raw Source/Core/Core/PowerPC/GDBStub.cpp
           if ($gdb.Contains("ScheduleEvent(GDB_UPDATE_CYCLES, s_update_event)")) {
@@ -42,6 +44,17 @@ jobs:
           }
           if (-not $gdb.Contains("GetGDBUpdateCycles()")) {
             throw "GetGDBUpdateCycles() missing after patch"
+          }
+          if (-not $gdb.Contains("qDolphinState")) {
+            throw "qDolphinState support missing after patch"
+          }
+          if (-not $gdb.Contains("loop_until_continue && !s_has_control.load()")) {
+            throw "manual GDB resume loop escape missing after patch"
+          }
+
+          $mainWindow = Get-Content -Raw Source/Core/DolphinQt/MainWindow.cpp
+          if (-not $mainWindow.Contains("GDBStub::ReleaseControl();")) {
+            throw "Dolphin GUI manual GDB resume hook missing after patch"
           }
 
       - name: Configure Visual Studio 2022 x64
@@ -85,6 +98,8 @@ jobs:
           ACCF GDB Dolphin custom build
           Source commit: ${{ github.sha }}
           GDB late attach: enabled
+          Manual GUI resume from GDB stop: enabled
+          MCP target-state query (qDolphinState): enabled
           Default GDBUpdateCycles: 5000000
           Minimum GDBUpdateCycles: 1000
 
